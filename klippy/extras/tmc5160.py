@@ -278,6 +278,31 @@ class TMC5160CurrentHelper:
         self.fields.set_field("globalscaler", gscaler)
         self.fields.set_field("ihold", ihold)
         self.fields.set_field("irun", irun)
+        self.vstart = config.getint("vstart", 100)  # Default VSTART value
+        self.vstop = config.getint("vstop", 100)    # Default VSTOP value
+        self.amax = config.getint("amax", 1000)     # Default AMAX value
+        self.vmax = config.getint("vmax", 51200)    # Default VMAX value
+        self.v1 = config.getint("v1", 20000)        # Default V1 value
+        self.a1 = config.getint("a1", 500)          # Default A1 value
+        self.d1 = config.getint("d1", 500)          # Default D1 value
+
+        # Set initial ramp generation values
+        self.set_register("RAMPMODE", 0x00)  # Positioning mode by default
+        self.set_register("VSTART", self.vstart)
+        self.set_register("VSTOP", self.vstop)
+        self.set_register("A1", self.a1)
+        self.set_register("V1", self.v1)
+        self.set_register("AMAX", self.amax)
+        self.set_register("VMAX", self.vmax)
+        self.set_register("D1", self.d1)
+
+        # Additional configuration based on features
+        self.vdcmin = config.getint("vdcmin", 256)  # Default VDCMIN for DcStep
+        self.set_register("VDCMIN", self.vdcmin)
+
+        # Other specific features
+        self.set_register("SW_MODE", config.getint("sw_mode", 0))  # Configure switch mode
+
     def _calc_globalscaler(self, current):
         globalscaler = int((current * 256. * math.sqrt(2.)
                             * self.sense_resistor / VREF) + .5)

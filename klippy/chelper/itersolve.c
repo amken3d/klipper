@@ -1,280 +1,167 @@
-// Iterative solver for kinematic moves
-//
-// Copyright (C) 2018-2020  Kevin O'Connor <kevin@koconnor.net>
-//
-// This file may be distributed under the terms of the GNU GPLv3 license.
-
-#include <math.h> // fabs
-#include <stddef.h> // offsetof
+#include <math.h>   // sqrt, fabs
+#include <stdlib.h> // malloc
 #include <string.h> // memset
-#include "compiler.h" // __visible
-#include "itersolve.h" // itersolve_generate_steps
-#include "pyhelper.h" // errorf
+#include "compiler.h"    // __visible
+#include "itersolve.h"   // struct coord
+#include "pyhelper.h"    // errorf
 #include "stepcompress.h" // queue_append_start
-#include "trapq.h" // struct move
-
 
 /****************************************************************
- * Main iterative solver
+ * Kinematic Moves and Ramps
+ ****************************************************************/
+
+struct move * __visible move_alloc(void) {
+    struct move *m = malloc(sizeof(*m));
+    memset(m, 0, sizeof(*m));
+    return m;
+}
+
+// SixPoint™ ramp generation setup for TMC5160
+void __visible move_fill_sixpoint(struct move *m, double print_time,
+                                  double a1, double v1, double amax, double dmax,
+                                  double start_pos_x, double start_pos_y, double start_pos_z,
+                                  double axes_d_x, double axes_d_y, double axes_d_z,
+                                  double start_v, double cruise_v, double accel) {
+    m->print_time = print_time;
+    m->move_t = a1 + v1 + amax + dmax;
+    m->accel_t = a1;
+    m->cruise_t = v1;
+    m->cruise_start_d = a1 * .5 * (cruise_v + start_v);
+    m->decel_start_d = m->cruise_start_d + v1 * cruise_v;
+
+    // Setup acceleration and deceleration for SixPoint™ ramp
+    m->cruise_v = cruise_v;
+    m->accel.c1 = start_v;
+    m->accel.c2 = .5 * accel;
+    m->decel.c1 = cruise_v;
+    m->decel.c2 = -m->accel.c2;
+
+    // Setup for move_get_coord()
+    m->start_pos.x = start_pos_x;
+    m->start_pos.y = start_pos_y;
+    m->start_pos.z = start_pos_z;
+    double inv_move_d = 1. / sqrt(axes_d_x * axes_d_x + axes_d_y * axes_d_y + axes_d_z * axes_d_z);
+    m->axes_r.x = axes_d_x * inv_move_d;
+    m->axes_r.y = axes_d_y * inv_move_d;
+    m->axes_r.z = axes_d_z * inv_move_d;
+}
+
+/****************************************************************
+ * Iterative Solver for TMC5160's SixPoint™ ramp
  ****************************************************************/
 
 struct timepos {
     double time, position;
 };
 
-#define SEEK_TIME_RESET 0.000100
-
-// Generate step times for a portion of a move
-static int32_t
-itersolve_gen_steps_range(struct stepper_kinematics *sk, struct move *m
-                          , double abs_start, double abs_end)
-{
-    sk_calc_callback calc_position_cb = sk->calc_position_cb;
-    double half_step = .5 * sk->step_dist;
-    double start = abs_start - m->print_time, end = abs_end - m->print_time;
-    if (start < 0.)
-        start = 0.;
-    if (end > m->move_t)
-        end = m->move_t;
-    struct timepos old_guess = {start, sk->commanded_pos}, guess = old_guess;
-    int sdir = stepcompress_get_step_dir(sk->sc);
-    int is_dir_change = 0, have_bracket = 0, check_oscillate = 0;
-    double target = sk->commanded_pos + (sdir ? half_step : -half_step);
-    double last_time=start, low_time=start, high_time=start + SEEK_TIME_RESET;
-    if (high_time > end)
-        high_time = end;
+// Find step using false position method
+static struct timepos itersolve_find_step(struct stepper_kinematics *sk, struct move *m,
+                                          struct timepos low, struct timepos high, double target) {
+    sk_callback calc_position = sk->calc_position;
+    struct timepos best_guess = high;
+    low.position -= target;
+    high.position -= target;
+    if (!high.position)
+        return best_guess;
+    int high_sign = signbit(high.position);
+    if (high_sign == signbit(low.position))
+        return (struct timepos){low.time, target};
     for (;;) {
-        // Use the "secant method" to guess a new time from previous guesses
-        double guess_dist = guess.position - target;
-        double og_dist = old_guess.position - target;
-        double next_time = ((old_guess.time*guess_dist - guess.time*og_dist)
-                            / (guess_dist - og_dist));
-        if (!(next_time > low_time && next_time < high_time)) { // or NaN
-            // Next guess is outside bounds checks - validate it
-            if (have_bracket) {
-                // A poor guess - fall back to bisection
-                next_time = (low_time + high_time) * .5;
-                check_oscillate = 0;
-            } else if (guess.time >= end) {
-                // No more steps present in requested time range
-                break;
-            } else {
-                // Might be a poor guess - limit to exponential search
-                next_time = high_time;
-                high_time = 2. * high_time - last_time;
-                if (high_time > end)
-                    high_time = end;
-            }
+        double guess_time = ((low.time * high.position - high.time * low.position)
+                             / (high.position - low.position));
+        if (fabs(guess_time - best_guess.time) <= .000000001)
+            break;
+        best_guess.time = guess_time;
+        best_guess.position = calc_position(sk, m, guess_time);
+        double guess_position = best_guess.position - target;
+        int guess_sign = signbit(guess_position);
+        if (guess_sign == high_sign) {
+            high.time = guess_time;
+            high.position = guess_position;
+        } else {
+            low.time = guess_time;
+            low.position = guess_position;
         }
-        // Calculate position at next_time guess
-        old_guess = guess;
-        guess.time = next_time;
-        guess.position = calc_position_cb(sk, m, next_time);
-        guess_dist = guess.position - target;
-        if (fabs(guess_dist) > .000000001) {
-            // Guess does not look close enough - update bounds
-            double rel_dist = sdir ? guess_dist : -guess_dist;
-            if (rel_dist > 0.) {
-                // Found position past target, so step is definitely present
-                if (have_bracket && old_guess.time <= low_time) {
-                    if (check_oscillate)
-                        // Force bisect next to avoid persistent oscillations
-                        old_guess = guess;
-                    check_oscillate = 1;
-                }
-                high_time = guess.time;
-                have_bracket = 1;
-            } else if (rel_dist < -(half_step + half_step + .000000010)) {
-                // Found direction change
-                sdir = !sdir;
-                target = (sdir ? target + half_step + half_step
-                          : target - half_step - half_step);
-                low_time = last_time;
-                high_time = guess.time;
-                is_dir_change = have_bracket = 1;
-                check_oscillate = 0;
-            } else {
-                low_time = guess.time;
-            }
-            if (!have_bracket || high_time - low_time > .000000001) {
-                if (!is_dir_change && rel_dist >= -half_step)
-                    // Avoid rollback if stepper fully reaches step position
-                    stepcompress_commit(sk->sc);
-                // Guess is not close enough - guess again with new time
+    }
+    return best_guess;
+}
+
+// Generate step times for TMC5160's SixPoint™ ramp during a move
+int32_t __visible itersolve_gen_steps(struct stepper_kinematics *sk, struct move *m) {
+    struct stepcompress *sc = sk->sc;
+    sk_callback calc_position = sk->calc_position;
+    double half_step = .5 * sk->step_dist;
+    double mcu_freq = stepcompress_get_mcu_freq(sc);
+    struct timepos last = {0., sk->commanded_pos}, low = last, high = last;
+    double seek_time_delta = 0.000100;
+    int sdir = stepcompress_get_step_dir(sc);
+    struct queue_append qa = queue_append_start(sc, m->print_time, .5);
+
+    for (;;) {
+        double dist = high.position - last.position;
+        if (fabs(dist) < half_step) {
+        seek_new_high_range:
+            if (high.time >= m->move_t)
+                break;
+            low = high;
+            high.time = last.time + seek_time_delta;
+            seek_time_delta += seek_time_delta;
+            if (high.time > m->move_t)
+                high.time = m->move_t;
+            high.position = calc_position(sk, m, high.time);
+            continue;
+        }
+        int next_sdir = dist > 0.;
+        if (unlikely(next_sdir != sdir)) {
+            if (fabs(dist) < half_step + .000000001)
+                goto seek_new_high_range;
+            if (last.time >= low.time && high.time > last.time) {
+                high.time = (last.time + high.time) * .5;
+                high.position = calc_position(sk, m, high.time);
                 continue;
             }
+            int ret = queue_append_set_next_step_dir(&qa, next_sdir);
+            if (ret)
+                return ret;
+            sdir = next_sdir;
         }
-        // Found next step - submit it
-        int ret = stepcompress_append(sk->sc, sdir, m->print_time, guess.time);
+        double target = last.position + (sdir ? half_step : -half_step);
+        struct timepos next = itersolve_find_step(sk, m, low, high, target);
+        int ret = queue_append(&qa, next.time * mcu_freq);
         if (ret)
             return ret;
-        target = sdir ? target+half_step+half_step : target-half_step-half_step;
-        // Reset bounds checking
-        double seek_time_delta = 1.5 * (guess.time - last_time);
+        seek_time_delta = next.time - last.time;
         if (seek_time_delta < .000000001)
             seek_time_delta = .000000001;
-        if (is_dir_change && seek_time_delta > SEEK_TIME_RESET)
-            seek_time_delta = SEEK_TIME_RESET;
-        last_time = low_time = guess.time;
-        high_time = guess.time + seek_time_delta;
-        if (high_time > end)
-            high_time = end;
-        is_dir_change = have_bracket = check_oscillate = 0;
+        last.position = target + (sdir ? half_step : -half_step);
+        last.time = next.time;
+        low = next;
+        if (last.time >= high.time)
+            goto seek_new_high_range;
     }
-    sk->commanded_pos = target - (sdir ? half_step : -half_step);
-    if (sk->post_cb)
-        sk->post_cb(sk);
+    queue_append_finish(qa);
+    sk->commanded_pos = last.position;
     return 0;
 }
 
-
-/****************************************************************
- * Interface functions
- ****************************************************************/
-
-// Check if a move is likely to cause movement on a stepper
-static inline int
-check_active(struct stepper_kinematics *sk, struct move *m)
-{
-    int af = sk->active_flags;
-    return ((af & AF_X && m->axes_r.x != 0.)
-            || (af & AF_Y && m->axes_r.y != 0.)
-            || (af & AF_Z && m->axes_r.z != 0.));
-}
-
-// Generate step times for a range of moves on the trapq
-int32_t __visible
-itersolve_generate_steps(struct stepper_kinematics *sk, double flush_time)
-{
-    double last_flush_time = sk->last_flush_time;
-    sk->last_flush_time = flush_time;
-    if (!sk->tq)
-        return 0;
-    trapq_check_sentinels(sk->tq);
-    struct move *m = list_first_entry(&sk->tq->moves, struct move, node);
-    while (last_flush_time >= m->print_time + m->move_t)
-        m = list_next_entry(m, node);
-    double force_steps_time = sk->last_move_time + sk->gen_steps_post_active;
-    int skip_count = 0;
-    for (;;) {
-        double move_start = m->print_time, move_end = move_start + m->move_t;
-        if (check_active(sk, m)) {
-            if (skip_count && sk->gen_steps_pre_active) {
-                // Must generate steps leading up to stepper activity
-                double abs_start = move_start - sk->gen_steps_pre_active;
-                if (abs_start < last_flush_time)
-                    abs_start = last_flush_time;
-                if (abs_start < force_steps_time)
-                    abs_start = force_steps_time;
-                struct move *pm = list_prev_entry(m, node);
-                while (--skip_count && pm->print_time > abs_start)
-                    pm = list_prev_entry(pm, node);
-                do {
-                    int32_t ret = itersolve_gen_steps_range(sk, pm, abs_start
-                                                            , flush_time);
-                    if (ret)
-                        return ret;
-                    pm = list_next_entry(pm, node);
-                } while (pm != m);
-            }
-            // Generate steps for this move
-            int32_t ret = itersolve_gen_steps_range(sk, m, last_flush_time
-                                                    , flush_time);
-            if (ret)
-                return ret;
-            if (move_end >= flush_time) {
-                sk->last_move_time = flush_time;
-                return 0;
-            }
-            skip_count = 0;
-            sk->last_move_time = move_end;
-            force_steps_time = sk->last_move_time + sk->gen_steps_post_active;
-        } else {
-            if (move_start < force_steps_time) {
-                // Must generates steps just past stepper activity
-                double abs_end = force_steps_time;
-                if (abs_end > flush_time)
-                    abs_end = flush_time;
-                int32_t ret = itersolve_gen_steps_range(sk, m, last_flush_time
-                                                        , abs_end);
-                if (ret)
-                    return ret;
-                skip_count = 1;
-            } else {
-                // This move doesn't impact this stepper - skip it
-                skip_count++;
-            }
-            if (flush_time + sk->gen_steps_pre_active <= move_end)
-                return 0;
-        }
-        m = list_next_entry(m, node);
-    }
-}
-
-// Check if the given stepper is likely to be active in the given time range
-double __visible
-itersolve_check_active(struct stepper_kinematics *sk, double flush_time)
-{
-    if (!sk->tq)
-        return 0.;
-    trapq_check_sentinels(sk->tq);
-    struct move *m = list_first_entry(&sk->tq->moves, struct move, node);
-    while (sk->last_flush_time >= m->print_time + m->move_t)
-        m = list_next_entry(m, node);
-    for (;;) {
-        if (check_active(sk, m))
-            return m->print_time;
-        if (flush_time <= m->print_time + m->move_t)
-            return 0.;
-        m = list_next_entry(m, node);
-    }
-}
-
-// Report if the given stepper is registered for the given axis
-int32_t __visible
-itersolve_is_active_axis(struct stepper_kinematics *sk, char axis)
-{
-    if (axis < 'x' || axis > 'z')
-        return 0;
-    return (sk->active_flags & (AF_X << (axis - 'x'))) != 0;
-}
-
-void __visible
-itersolve_set_trapq(struct stepper_kinematics *sk, struct trapq *tq)
-{
-    sk->tq = tq;
-}
-
-void __visible
-itersolve_set_stepcompress(struct stepper_kinematics *sk
-                           , struct stepcompress *sc, double step_dist)
-{
+void __visible itersolve_set_stepcompress(struct stepper_kinematics *sk, struct stepcompress *sc,
+                                          double step_dist, bool spi_motion) {
     sk->sc = sc;
     sk->step_dist = step_dist;
+    sk->spi_motion = spi_motion;
 }
 
-double __visible
-itersolve_calc_position_from_coord(struct stepper_kinematics *sk
-                                   , double x, double y, double z)
-{
+double __visible itersolve_calc_position_from_coord(struct stepper_kinematics *sk, double x, double y, double z) {
     struct move m;
     memset(&m, 0, sizeof(m));
-    m.start_pos.x = x;
-    m.start_pos.y = y;
-    m.start_pos.z = z;
-    m.move_t = 1000.;
-    return sk->calc_position_cb(sk, &m, 500.);
+    move_fill_sixpoint(&m, 0., 0., 1., 0., x, y, z, 0., 1., 0., 0., 1., 0.);
+    return sk->calc_position(sk, &m, 0.);
 }
 
-void __visible
-itersolve_set_position(struct stepper_kinematics *sk
-                       , double x, double y, double z)
-{
-    sk->commanded_pos = itersolve_calc_position_from_coord(sk, x, y, z);
+void __visible itersolve_set_commanded_pos(struct stepper_kinematics *sk, double pos) {
+    sk->commanded_pos = pos;
 }
 
-double __visible
-itersolve_get_commanded_pos(struct stepper_kinematics *sk)
-{
+double __visible itersolve_get_commanded_pos(struct stepper_kinematics *sk) {
     return sk->commanded_pos;
 }
